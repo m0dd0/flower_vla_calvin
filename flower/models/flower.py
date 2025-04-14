@@ -694,6 +694,98 @@ class FLOWERVLA(pl.LightningModule):
             'attention_mask': attention_mask,
         }
 
+    def encode_observations_paligemma(self, batch: Dict) -> torch.Tensor:
+        """Encode observations using PaliGemma2"""
+        device = self.device
+        default_type = next(self.parameters()).dtype
+
+        # Process primary view images: [B, T, C, H, W] -> [B*T, C, H, W]
+        image_tensor = batch["rgb_obs"]['rgb_static']
+        B, T, C, H, W = image_tensor.shape
+        pixel_values = image_tensor.view(-1, C, H, W).to(device).to(default_type)
+
+        # Process image features
+        image_outputs = self.vlm.vision_tower(pixel_values)
+        image_features = self.vlm.multi_modal_projector(image_outputs.last_hidden_state)
+        image_features = image_features / (self.vlm.config.hidden_size ** 0.5)
+        L = image_features.shape[1]
+        image_features = image_features.view(B, T * L, -1)
+        # print(f"image features: {image_features.shape}")
+        # Optional second view
+        if self.use_second_view:
+            image2_tensor = batch["rgb_obs"]['rgb_gripper']
+            pixel_values2 = image2_tensor.view(-1, C, H, W).to(device).to(default_type)
+            image2_features = self.vlm.get_image_features(pixel_values2)
+            L2 = image2_features.shape[1]
+            image2_features = image2_features.view(B, T * L2, -1)
+            image_features = torch.cat([image_features, image2_features], dim=1)
+
+        # Build prompts and tokenize
+        prompts = self.construct_prompts(batch)  # should include "<image>"
+        tokenized = self.tokenizer(
+            prompts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=336,
+        ).to(device)
+        input_ids = tokenized["input_ids"]
+        attention_mask = tokenized["attention_mask"]
+        # print(f"attention mask: {attention_mask[0]}")
+        inputs_embeds = self.vlm.get_input_embeddings()(input_ids).clone()
+
+        # Create special mask and replace <image> tokens with features
+        image_token_mask = (input_ids == self.special_image_token_id).unsqueeze(-1)  # shape [B, T, 1]
+        image_token_mask = image_token_mask.expand_as(inputs_embeds)  # shape [B, T, D]
+
+        if image_features.numel() != inputs_embeds[image_token_mask].numel():
+            print(f"Image features numel: {image_features.numel()}")
+            print(f"Inputs embeds selected by mask: {inputs_embeds[image_token_mask].numel()}")
+            raise ValueError("Mismatch between number of <image> tokens and image features.")
+
+        # Replace image token embeddings with image features
+        image_features = image_features.to(inputs_embeds.dtype)
+        inputs_embeds = inputs_embeds.masked_scatter(image_token_mask, image_features)
+
+        # Position IDs for rotary embeddings
+        seq_len = input_ids.shape[1]
+        position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
+
+       # Create attention mask where padding tokens are -inf (masked out)
+        pad_mask = tokenized["attention_mask"] == 0  # True for padding tokens
+        attention_mask = torch.zeros_like(tokenized["attention_mask"], dtype=inputs_embeds.dtype)
+        attention_mask = attention_mask.masked_fill(pad_mask, float("-inf"))
+        attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)  # [B, 1, 1, T]
+
+        # print(f"attention mask: {attention_mask[0]}")
+        lm_output = self.vlm.language_model(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            output_hidden_states=True,
+            return_dict=True
+        )
+        # print(f"lm_output: {lm_output.hidden_states[-1].shape}")
+        features = lm_output.hidden_states[-1]
+        features = self.vlm_token_dropout(features)
+
+        # Frequency embedding
+        embed_tensor = torch.zeros(B, 1, 1, device=device, dtype=default_type)
+        frequency_embeds = self.frequency_embedder(torch.ones_like(embed_tensor).to(device) * 3)
+
+        proprio = None
+        if self.use_proprio and 'proprio' in batch.get(self.obs_modalities, {}):
+            proprio = batch[self.obs_modalities]['proprio'].to(device).to(default_type)
+
+        return {
+            'features': features,
+            'frequency_embeds': frequency_embeds,
+            'action_space_embeds': None,
+            'action_type': torch.ones(B, self.act_window_size, 7, device=device),
+            'proprio': proprio,
+            'attention_mask': attention_mask,
+        }
+
     def encode_actions(self, z: torch.Tensor, action_type: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Encode actions using action-specific encoders."""
         default_dtype = next(self.parameters()).dtype

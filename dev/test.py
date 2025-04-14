@@ -11,7 +11,8 @@ from flower.models.flower import FLOWERVLA
 
 if __name__ == "__main__":
     episode_data_calvin = np.load(
-        r"C:\Users\mohes\Documents\Coding\flower_vla_calvin\data\calvin_debug_dataset\calvin_debug_dataset\validation\episode_0553567.npz"
+        # r"C:\Users\mohes\Documents\Coding\flower_vla_calvin\data\calvin_debug_dataset\calvin_debug_dataset\validation\episode_0553567.npz"
+        "/home/moritz/Documents/Repos/flower_vla_calvin/data/calvin_debug_dataset/validation/episode_0553568.npz"
     )
     episode_data_calvin = dict(episode_data_calvin)
 
